@@ -1,12 +1,12 @@
 """
-Rendering Engine
-Handles all character rendering with floating joints
-Fixed for actual sprite dimensions
+Rendering Engine - Direct Skeleton Following
+Each sprite attaches directly to skeleton joints and extends along skeleton lines
 """
 
 import cv2
 import numpy as np
 import mediapipe as mp
+import math
 from config import *
 from utils import overlay_image, get_rotation_angle, calculate_distance
 from floating_system import FloatingSystem, PositionSmoother, RotationSmoother, TailAnimator
@@ -14,7 +14,7 @@ from expression import ExpressionController
 
 
 class CharacterRenderer:
-    """Renders character with tracking data"""
+    """Renders character sprites directly onto skeleton structure"""
     
     def __init__(self, character):
         self.character = character
@@ -30,18 +30,17 @@ class CharacterRenderer:
         # Previous position for velocity calculation
         self.prev_body_pos = None
         
-        # Sprite-specific scale adjustments (relative to base scale)
-        # Based on actual sprite dimensions vs body proportions
+        # Sprite-specific scale adjustments
         self.sprite_scales = {
-            'head': 0.45,  # Head is 744x872, increase from 0.25
-            'body_tail': 0.35,  # Body is 1293x1170, increase from 0.18
-            'arm': 0.8,  # Arms are ~211-316px
-            'leg': 0.8,  # Legs are ~137-275px
-            'eye': 2.2,  # Eyes are 58x50-84
-            'mouth': 1.0,  # Mouth is 203-211x35-82
+            'head': 0.4,
+            'body_tail': 0.5,
+            'arm': 0.6,
+            'leg': 0.6,
+            'eye': 1.0,
+            'mouth': 1.0,
         }
         
-        # Offset multipliers for facial features (relative to head scale)
+        # Face feature offsets
         self.face_offsets = {
             'eye_left_x': -60,
             'eye_left_y': -30,
@@ -49,6 +48,14 @@ class CharacterRenderer:
             'eye_right_y': -30,
             'mouth_x': 0,
             'mouth_y': 55,
+        }
+        
+        # Pivot offsets for extending sprites from joints
+        # Negative = sprite extends downward/forward from pivot point
+        self.pivot_offsets = {
+            'upper': -0.2,    # Upper segments extend from shoulder/hip
+            'middle': -0.2,   # Middle segments extend from elbow/knee
+            'lower': -0.15,    # Hand/foot at wrist/ankle
         }
     
     def render(self, frame, pose_landmarks, face_tracker, body_tracker):
@@ -58,14 +65,14 @@ class CharacterRenderer:
         
         h, w = frame.shape[:2]
         
-        # Calculate scale based on distance
+        # Calculate scale
         distance_scale = body_tracker.calculate_scale_factor(pose_landmarks, w, h)
         self.character.set_scale(distance_scale * BASE_SCALE)
         
-        # Get all body positions
+        # Extract positions with floating
         positions = self._extract_positions(pose_landmarks, body_tracker, w, h)
         
-        # Update expression
+        # Update expression (default: eyes open, mouth neutral)
         if face_tracker:
             left_eye = face_tracker.smoothed_left_eye_ratio
             right_eye = face_tracker.smoothed_right_eye_ratio
@@ -76,7 +83,7 @@ class CharacterRenderer:
         # Calculate body velocity
         body_velocity = self._calculate_body_velocity(positions.get('torso'))
         
-        # Render in correct z-order (back to front)
+        # Render in z-order (back to front)
         frame = self._render_back_leg(frame, positions)
         frame = self._render_back_arm(frame, positions)
         frame = self._render_body(frame, positions, body_velocity)
@@ -87,10 +94,10 @@ class CharacterRenderer:
         return frame
     
     def _extract_positions(self, landmarks, body_tracker, width, height):
-        """Extract and smooth all body part positions"""
+        """Extract and smooth positions"""
         positions = {}
         
-        # Get raw positions
+        # Get raw positions from MediaPipe
         raw = {
             'nose': body_tracker.get_landmark_position(landmarks, self.mp_pose.NOSE, width, height),
             'left_shoulder': body_tracker.get_landmark_position(landmarks, self.mp_pose.LEFT_SHOULDER, width, height),
@@ -118,15 +125,16 @@ class CharacterRenderer:
             hc_y = (raw['left_hip'][1] + raw['right_hip'][1]) / 2
             raw['hip_center'] = (hc_x, hc_y)
         
-        # Torso at midpoint between shoulder and hip centers
+        # Torso center
         if raw.get('shoulder_center') and raw.get('hip_center'):
             tc_x = (raw['shoulder_center'][0] + raw['hip_center'][0]) / 2
             tc_y = (raw['shoulder_center'][1] + raw['hip_center'][1]) / 2
             raw['torso'] = (tc_x, tc_y)
         
-        # Head position (nose with offset)
-        if raw['nose']:
-            raw['head'] = raw['nose']
+        # Head position
+        if raw.get('shoulder_center'):
+            head_offset = 80 * self.character.current_scale
+            raw['head'] = (raw['shoulder_center'][0], raw['shoulder_center'][1] - head_offset)
         
         # Apply smoothing and floating
         for key, pos in raw.items():
@@ -138,7 +146,7 @@ class CharacterRenderer:
         return positions
     
     def _calculate_body_velocity(self, current_pos):
-        """Calculate body movement velocity"""
+        """Calculate body velocity"""
         if current_pos is None or self.prev_body_pos is None:
             velocity = 0
         else:
@@ -149,12 +157,11 @@ class CharacterRenderer:
         return velocity
     
     def _get_scaled_sprite(self, sprite_name, sprite_type='default'):
-        """Get sprite with proper scaling"""
+        """Get scaled sprite"""
         sprite = self.character.get_sprite(sprite_name)
         if sprite is None:
             return None
         
-        # Apply sprite-specific scale adjustment
         type_scale = self.sprite_scales.get(sprite_type, 1.0)
         adjusted_scale = self.character.current_scale * type_scale
         
@@ -164,8 +171,50 @@ class CharacterRenderer:
         
         return sprite
     
+    def _render_segment_on_skeleton(self, frame, sprite_name, sprite_type, 
+                                     start_joint, end_joint, segment_type):
+        """
+        Render sprite segment extending from start_joint towards end_joint
+        Sprite pivot at start_joint, extends along skeleton line
+        """
+        sprite = self._get_scaled_sprite(sprite_name, sprite_type)
+        if sprite is None or start_joint is None or end_joint is None:
+            return frame
+        
+        # Calculate rotation angle from start to end
+        rotation = get_rotation_angle(start_joint, end_joint)
+        
+        # Smooth rotation
+        smooth_key = f'{sprite_name}_rotation'
+        rotation = self.rotation_smoother.smooth_rotation(smooth_key, rotation)
+        
+        h, w = sprite.shape[:2]
+        
+        # Get pivot offset for this segment type
+        pivot_offset_pct = self.pivot_offsets.get(segment_type, 0)
+        offset_y = h * pivot_offset_pct
+        offset_x = 0
+        
+        # Rotate offset vector
+        angle_rad = math.radians(rotation)
+        cos_a = math.cos(angle_rad)
+        sin_a = math.sin(angle_rad)
+        
+        rotated_offset_x = offset_x * cos_a - offset_y * sin_a
+        rotated_offset_y = offset_x * sin_a + offset_y * cos_a
+        
+        # Apply offset to start joint position
+        render_x = start_joint[0] + rotated_offset_x
+        render_y = start_joint[1] + rotated_offset_y
+        render_pos = (render_x, render_y)
+        
+        # Render sprite
+        frame = overlay_image(frame, sprite, render_pos, rotation=rotation)
+        
+        return frame
+    
     def _render_head(self, frame, positions):
-        """Render head with facial features"""
+        """Render head with expressions"""
         if 'head' not in positions:
             return frame
         
@@ -177,17 +226,18 @@ class CharacterRenderer:
         if head is not None:
             frame = overlay_image(frame, head, head_pos)
         
-        # Get expression sprites
+        # Get expression sprites (default: open eyes, neutral mouth)
         left_eye_name, right_eye_name = self.expression_controller.get_eye_sprites()
         mouth_name = self.expression_controller.get_mouth_sprite()
         
-        # Render eyes with proper scale and offset
+        # Render left eye
         left_eye = self._get_scaled_sprite(left_eye_name, 'eye')
         if left_eye is not None:
             eye_x = head_pos[0] + self.face_offsets['eye_left_x'] * base_scale
             eye_y = head_pos[1] + self.face_offsets['eye_left_y'] * base_scale
             frame = overlay_image(frame, left_eye, (eye_x, eye_y))
         
+        # Render right eye
         right_eye = self._get_scaled_sprite(right_eye_name, 'eye')
         if right_eye is not None:
             eye_x = head_pos[0] + self.face_offsets['eye_right_x'] * base_scale
@@ -204,7 +254,7 @@ class CharacterRenderer:
         return frame
     
     def _render_body(self, frame, positions, body_velocity):
-        """Render body/torso with tail"""
+        """Render body with tail"""
         if 'torso' not in positions:
             return frame
         
@@ -218,15 +268,18 @@ class CharacterRenderer:
         return frame
     
     def _render_back_arm(self, frame, positions):
-        """Render back arm (right in mirror)"""
         return self._render_arm(frame, positions, 'right')
     
     def _render_front_arm(self, frame, positions):
-        """Render front arm (left in mirror)"""
         return self._render_arm(frame, positions, 'left')
     
     def _render_arm(self, frame, positions, side):
-        """Render arm segments - each segment connects joints properly"""
+        """
+        Render arm following skeleton structure:
+        - Upper: extends from shoulder (12/11) to elbow (14/13)
+        - Middle: extends from elbow (14/13) to wrist (16/15)
+        - Lower (hand): at wrist (16/15), rotation follows forearm
+        """
         shoulder = positions.get(f'{side}_shoulder')
         elbow = positions.get(f'{side}_elbow')
         wrist = positions.get(f'{side}_wrist')
@@ -234,43 +287,56 @@ class CharacterRenderer:
         if not (shoulder and elbow and wrist):
             return frame
         
-        # Calculate rotations based on actual joint connections
-        # Upper arm: shoulder pointing to elbow
-        upper_rot = get_rotation_angle(shoulder, elbow)
-        # Lower arm: elbow pointing to wrist
-        lower_rot = get_rotation_angle(elbow, wrist)
+        # Render upper arm: shoulder → elbow
+        frame = self._render_segment_on_skeleton(
+            frame, f'arm_{side}_upper', 'arm',
+            shoulder, elbow, 'upper'
+        )
         
-        # Smooth rotations
-        upper_rot = self.rotation_smoother.smooth_rotation(f'{side}_upper_arm', upper_rot)
-        lower_rot = self.rotation_smoother.smooth_rotation(f'{side}_lower_arm', lower_rot)
+        # Render middle arm (forearm): elbow → wrist
+        frame = self._render_segment_on_skeleton(
+            frame, f'arm_{side}_middle', 'arm',
+            elbow, wrist, 'middle'
+        )
         
-        # Render upper arm - positioned AT shoulder, pointing towards elbow
-        upper = self._get_scaled_sprite(f'arm_{side}_upper', 'arm')
-        if upper is not None:
-            frame = overlay_image(frame, upper, shoulder, rotation=upper_rot)
+        # Render lower arm (hand): at wrist, rotation follows forearm
+        forearm_rotation = get_rotation_angle(elbow, wrist)
+        forearm_rotation = self.rotation_smoother.smooth_rotation(
+            f'{side}_forearm_rot', forearm_rotation
+        )
         
-        # Render middle arm - positioned AT elbow
-        middle = self._get_scaled_sprite(f'arm_{side}_middle', 'arm')
-        if middle is not None:
-            frame = overlay_image(frame, middle, elbow, rotation=lower_rot)
-        
-        # Render lower arm/hand - positioned AT wrist
-        lower = self._get_scaled_sprite(f'arm_{side}_lower', 'arm')
-        if lower is not None:
-            frame = overlay_image(frame, lower, wrist, rotation=lower_rot)
+        hand_sprite = self._get_scaled_sprite(f'arm_{side}_lower', 'arm')
+        if hand_sprite is not None:
+            h, w = hand_sprite.shape[:2]
+            
+            # Hand pivot offset (slightly adjusted for natural wrist position)
+            pivot_offset = self.pivot_offsets['lower']
+            offset_y = h * pivot_offset
+            
+            angle_rad = math.radians(forearm_rotation)
+            rotated_offset_x = -offset_y * math.sin(angle_rad)
+            rotated_offset_y = offset_y * math.cos(angle_rad)
+            
+            hand_x = wrist[0] + rotated_offset_x
+            hand_y = wrist[1] + rotated_offset_y
+            
+            frame = overlay_image(frame, hand_sprite, (hand_x, hand_y), rotation=forearm_rotation)
         
         return frame
     
     def _render_back_leg(self, frame, positions):
-        """Render back leg (right in mirror)"""
         return self._render_leg(frame, positions, 'right')
     
     def _render_front_leg(self, frame, positions):
-        """Render front leg (left in mirror)"""
         return self._render_leg(frame, positions, 'left')
     
     def _render_leg(self, frame, positions, side):
-        """Render leg segments - each segment connects joints properly"""
+        """
+        Render leg following skeleton structure:
+        - Upper: extends from hip (24/23) to knee (26/25)
+        - Middle: extends from knee (26/25) to ankle (28/27)
+        - Lower (foot): at ankle (28/27), rotation follows shin
+        """
         hip = positions.get(f'{side}_hip')
         knee = positions.get(f'{side}_knee')
         ankle = positions.get(f'{side}_ankle')
@@ -278,33 +344,39 @@ class CharacterRenderer:
         if not (hip and knee and ankle):
             return frame
         
-        # Calculate rotations based on actual joint connections
-        # Upper leg: hip pointing to knee
-        upper_rot = get_rotation_angle(hip, knee)
-        # Lower leg: knee pointing to ankle
-        lower_rot = get_rotation_angle(knee, ankle)
+        # Render upper leg: hip → knee
+        frame = self._render_segment_on_skeleton(
+            frame, f'leg_{side}_upper', 'leg',
+            hip, knee, 'upper'
+        )
         
-        # Smooth rotations
-        upper_rot = self.rotation_smoother.smooth_rotation(f'{side}_upper_leg', upper_rot)
-        lower_rot = self.rotation_smoother.smooth_rotation(f'{side}_lower_leg', lower_rot)
+        # Render middle leg (shin): knee → ankle
+        frame = self._render_segment_on_skeleton(
+            frame, f'leg_{side}_middle', 'leg',
+            knee, ankle, 'middle'
+        )
         
-        # Render upper leg - positioned AT hip, pointing towards knee
-        upper = self._get_scaled_sprite(f'leg_{side}_upper', 'leg')
-        if upper is not None:
-            frame = overlay_image(frame, upper, hip, rotation=upper_rot)
+        # Render lower leg (foot): at ankle, rotation follows shin
+        shin_rotation = get_rotation_angle(knee, ankle)
+        shin_rotation = self.rotation_smoother.smooth_rotation(
+            f'{side}_shin_rot', shin_rotation
+        )
         
-        # Render middle leg - positioned AT knee
-        middle = self._get_scaled_sprite(f'leg_{side}_middle', 'leg')
-        if middle is not None:
-            frame = overlay_image(frame, middle, knee, rotation=lower_rot)
-        
-        # Render lower leg/foot - positioned AT ankle
-        lower = self._get_scaled_sprite(f'leg_{side}_lower', 'leg')
-        if lower is not None:
-            frame = overlay_image(frame, lower, ankle, rotation=lower_rot)
+        foot_sprite = self._get_scaled_sprite(f'leg_{side}_lower', 'leg')
+        if foot_sprite is not None:
+            h, w = foot_sprite.shape[:2]
+            
+            # Foot pivot offset
+            pivot_offset = self.pivot_offsets['lower']
+            offset_y = h * pivot_offset
+            
+            angle_rad = math.radians(shin_rotation)
+            rotated_offset_x = -offset_y * math.sin(angle_rad)
+            rotated_offset_y = offset_y * math.cos(angle_rad)
+            
+            foot_x = ankle[0] + rotated_offset_x
+            foot_y = ankle[1] + rotated_offset_y
+            
+            frame = overlay_image(frame, foot_sprite, (foot_x, foot_y), rotation=shin_rotation)
         
         return frame
-    
-    def _midpoint(self, p1, p2):
-        """Calculate midpoint between two positions"""
-        return ((p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2)
